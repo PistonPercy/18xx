@@ -86,6 +86,7 @@ module Engine
       static = opts[:routes] || []
       path_timeout = opts[:path_timeout] || 30
       route_limit = opts[:route_limit] || 10_000
+      path_debugger = opts[:path_debugger] || lambda { }
 
       connections = {}
 
@@ -203,8 +204,11 @@ module Engine
               connection_data: connection.clone,
               bitfield: bitfield_from_connection(connection, hexside_bits),
             )
+
+            %x{ if (!path_debugger("walk", route)) return; }
             route.routes = [route]
             route.revenue(suppress_check_other: true) # defer route-collection checks til later
+            %x{ if (!path_debugger("valid_route", route)) return; }
             train_routes[train] << route
           rescue RouteTooLong
             # ignore for this train, and abort walking this path if ignored for all trains
