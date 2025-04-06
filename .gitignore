@@ -34,3 +34,8 @@ validate*.json
 .idea
 
 .vscode
+.game-corpus
+.minimal_corpus
+output.json
+output_off_by_one_in_action_id.json
+output*

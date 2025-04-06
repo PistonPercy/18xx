@@ -7,10 +7,55 @@ require_relative 'route'
 
 module Engine
   class AutoRouter
+    attr_accessor :running
+
     def initialize(game, flash = nil)
       @game = game
       @next_hexside_bit = 0
       @flash = flash
+    end
+
+    def compute_new(corporation, **opts)
+      # we don't reverse in the new one since we select trains in reverse order
+      trains = @game.route_trains(corporation).sort_by(&:price)
+      train_routes, path_walk_timed_out = path(trains, corporation, **opts)
+      if path_walk_timed_out
+        @flash&.call('Auto route path walk failed to complete (PATH TIMEOUT)')
+      end
+      new_route(train_routes, **opts)
+    end
+
+    def new_route(trains_to_routes, **opts)
+      callback = opts[:callback]
+      @running = true
+      %x{
+          let start = performance.now()
+          g_update = callback
+          new_autoroute(self, trains_to_routes).then((routes) => {
+            // Fix up the revenue calculations since routes revenue can be
+            // impacted by each other
+            self.$real_revenue(routes)
+            self.running = false
+            console.log("AutoRouter took " + (performance.now() - start) + "ms")
+            callback(routes);
+          }).catch((e) => {
+            self.flash("Auto route selection failed to complete (" + e + ")");
+            console.log(e);
+            self.running = false;
+            callback([]);
+          });
+        }
+    end
+
+    def real_revenue(routes)
+      routes.each do |route|
+        route.clear_cache!(only_revenue: true)
+        route.routes = routes
+        route.revenue
+      end
+      @game.routes_revenue(routes)
+    rescue Exception
+      -1
     end
 
     def compute(corporation, **opts)
@@ -25,17 +70,23 @@ module Engine
 
       routes = opts.delete(:routes)
 
-      train_groups.flat_map do |train_group|
+      final_routes = train_groups.flat_map do |train_group|
         opts[:routes] = routes.select { |r| train_group.include?(r.train) }
         compute_for_train_group(train_group, corporation, **opts)
       end
+
+      # a route's revenue calculation can depend on other routes, so we need to
+      # recalculate revenue for the final set of routes.
+      # This fixes https://github.com/tobymao/18xx/issues/11078 / https://github.com/tobymao/18xx/issues/11036
+      real_revenue final_routes
+      final_routes
     end
 
-    def compute_for_train_group(trains, corporation, **opts)
+    def path(trains, corporation, **opts)
       static = opts[:routes] || []
       path_timeout = opts[:path_timeout] || 30
-      route_timeout = opts[:route_timeout] || 10
       route_limit = opts[:route_limit] || 10_000
+      path_debugger = opts[:path_debugger] || lambda { }
 
       connections = {}
 
@@ -83,7 +134,7 @@ module Engine
           last_right = nil
 
           complete = lambda do
-            chains << { nodes: [left, right], paths: chain }
+            chains << { nodes: [left, right], paths: chain, hexes: chain.map(&:hex) }
             last_left = left
             last_right = right
             left, right = nil
@@ -147,11 +198,17 @@ module Engine
               @game,
               @game.phase,
               train,
-              connection_data: connection,
+              # we have to clone to prevent multiple routes having the same connection array.
+              # If we don't clone, then later route.touch_node calls will affect all routes with
+              # the same connection array
+              connection_data: connection.clone,
               bitfield: bitfield_from_connection(connection, hexside_bits),
             )
+
+            %x{ if (!path_debugger("walk", route)) return; }
             route.routes = [route]
             route.revenue(suppress_check_other: true) # defer route-collection checks til later
+            %x{ if (!path_debugger("valid_route", route)) return; }
             train_routes[train] << route
           rescue RouteTooLong
             # ignore for this train, and abort walking this path if ignored for all trains
@@ -181,6 +238,13 @@ module Engine
         train_routes[train] = routes.sort_by(&:revenue).reverse.take(route_limit)
       end
 
+      [train_routes, path_walk_timed_out]
+    end
+
+    def compute_for_train_group(trains, corporation, **opts)
+      route_timeout = opts[:route_timeout] || 10
+
+      train_routes, path_walk_timed_out = path(trains, corporation, **opts)
       sorted_routes = train_routes.map { |_train, routes| routes }
 
       limit = sorted_routes.map(&:size).reduce(&:*)
@@ -451,6 +515,197 @@ module Engine
           }
         }
         return false
+      }
+
+      function estimate_revenue(router, routes, routes_metadata) {
+        // This is just a quick example of optimizations we can apply here.
+        // Calling back into ruby is expensive, so we try to estimate in js the
+        // upper bound of revenue and if the combo of routes are valid.
+
+        // This is just the "routes can't overlap" optimization using an opt
+        // out. An opt in would probably be safer, but the old autorouter always
+        // assumes it's valid, so this is no worse. Once we figure out how to configure
+        // the auto router per game, we should change this.
+
+        const opt_fails_overlap = {
+          1822: true,
+          1860: true,
+          1862: true,
+          "18 Los Angeles 2": true,
+        };
+        if (!opt_fails_overlap[router.title] && routes_metadata.overlap) {
+          return -1;
+        }
+        return routes_metadata.estimate_revenue;
+      }
+
+
+      function is_worth_adding_trains(router, routes, routes_metadata, next_routes) {
+        // TODO: I wonder if it's always true that revenue is less than
+        // or equal to the sum of the revenues of trains individually
+        return (
+          routes_metadata.estimate_revenue +
+            next_routes.max_possible_revenue_for_rest_of_trains >
+            router.best_revenue_so_far
+        );
+      }
+
+      function add_train_to_routes_metadata(
+        selected_routes,
+        route,
+        selected_routes_metadata,
+      ) {
+        return {
+          estimate_revenue:
+            selected_routes_metadata.estimate_revenue + route.estimate_revenue,
+          bitfield: js_route_bitfield_merge(
+            route.bitfield,
+            selected_routes_metadata.bitfield,
+          ),
+          overlap:
+            selected_routes_metadata.overlap ||
+            new_js_route_bitfield_conflicts(
+              route.bitfield,
+              selected_routes_metadata.bitfield,
+            ),
+        };
+      }
+
+      function get_empty_metadata() {
+        return {
+          estimate_revenue: 0,
+          bitfield: [],
+          overlap: false,
+        };
+      }
+
+      let start_of_execution_tick = 0;
+      let start_of_all = 0;
+      function next_frame() {
+        return new Promise(resolve => requestAnimationFrame(resolve));
+      }
+
+
+      async function new_autoroute(router, trains_to_routes_map) {
+        start_of_all = start_of_execution_tick = performance.now();
+        router.title = router.game.$meta().$title();
+        router.best_revenue_so_far = 0; // the best revenue we have found for a valid set of trains
+        router.best_routes = []; // the best set of routes
+        let trains_to_routes = Array.from(trains_to_routes_map).map(
+          ([train, routes]) => routes,
+        );
+
+        for (let i = 0; i < trains_to_routes.length; ++i) {
+          for (let j = 0; j < trains_to_routes[i].length; ++j) {
+            trains_to_routes[i][j].estimate_revenue = trains_to_routes[i][j].revenue;
+          }
+        }
+        let next_routes = null;
+        trains_to_routes.forEach((routes) => {
+          let r = next_routes
+            ? next_routes.max_possible_revenue_for_rest_of_trains
+            : 0;
+          r += routes[0].estimate_revenue;
+          next_routes = {
+            routes,
+            max_possible_revenue_for_rest_of_trains: r,
+            next: next_routes,
+          };
+        });
+        await find_best_combo(router, [], get_empty_metadata(), next_routes);
+
+        return router.best_routes;
+      }
+
+      // selected_routes : [Route] -- the subset of trains we are exploring and will expand on
+      // selected_routes_metadata : a bag of information to make searching faster. Example things: revenue of selected routes and bitset of trains routes
+      // next_routes : ?{ routes: [Route], max_possible_revenue_for_rest_of_trains: int,  next: NextRoutes}. This is basically a recursive data structure where we have a layer per train
+      async function find_best_combo(
+        router,
+        selected_routes,
+        selected_routes_metadata,
+        next_routes,
+      ) {
+        for (let route of next_routes.routes) {
+          if (performance.now() - start_of_execution_tick > 30) {
+            if (router.render) {
+                router.$real_revenue(router.best_routes)
+                g_update(router.best_routes)
+            }
+            await next_frame();
+            if (!router.running) {
+              return;
+            }
+            start_of_execution_tick = performance.now();
+          }
+          let current_routes_metadata = add_train_to_routes_metadata(
+            selected_routes,
+            route,
+            selected_routes_metadata,
+          );
+          // TODO: We probably will want to avoid the array copy for performance, but this is easier to understand for now
+          let current_routes = [...selected_routes, route];
+
+          // check if this new subset is the new best route
+          let estimate = estimate_revenue(router, current_routes, current_routes_metadata);
+          if (estimate > router.best_revenue_so_far) {
+            let revenue = router.$real_revenue(current_routes);
+            if (revenue > router.best_revenue_so_far) {
+              router.best_revenue_so_far = revenue;
+              router.best_routes = current_routes.map((r) => r.$clone());
+              router.render = true;
+            }
+          }
+
+          // if we have more routes to check
+          if (next_routes.next !== null) {
+          // first check without this train, so we don't get
+            // stuck with duplicate routes with 100% overlap on 1862 type maps as the suggested routes
+            await find_best_combo(
+              router,
+              selected_routes,
+              selected_routes_metadata,
+              next_routes.next,
+            );
+
+            // if we have another train to search for routes, check if it's worth exploring and if so, explore!
+            if (
+              is_worth_adding_trains(
+                router,
+                current_routes,
+                current_routes_metadata,
+                next_routes.next,
+              )
+            ) {
+              await find_best_combo(
+                router,
+                current_routes,
+                current_routes_metadata,
+                next_routes.next,
+              );
+            } else if (next_routes.next != null) {
+              console.log("skipping");
+            }
+          }
+        }
+      }
+
+      function new_js_route_bitfield_conflicts(a, b) {
+        let index = Math.min(a.length, b.length) - 1;
+        while (index >= 0) {
+          if ((a[index] & b[index]) != 0) return true;
+          index -= 1;
+        }
+        return false;
+      }
+
+      function js_route_bitfield_merge(a, b) {
+        let max = Math.max(a.length, b.length);
+        let result = [];
+        for (let i = 0; i < max; ++i) {
+          result.push((a[i] ?? 0) | (b[i] ?? 0));
+        }
+        return result;
       }
     }
   end
