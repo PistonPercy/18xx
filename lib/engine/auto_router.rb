@@ -14,6 +14,7 @@ module Engine
       @train_autoroute_group = @game.class::TRAIN_AUTOROUTE_GROUPS
       @next_hexside_bit = 0
       @flash = flash
+      @chains = {}
     end
 
     def compute(corporation, **opts)
@@ -44,115 +45,146 @@ module Engine
 
     def path(trains, corporation, **opts)
       static = opts[:routes] || []
-      path_timeout = opts[:path_timeout] || 30
+      path_timeout = 10
       route_limit = opts[:route_limit] || 10_000
 
       connections = {}
 
       graph = @game.graph_for_entity(corporation)
-      nodes = graph.connected_nodes(corporation).keys.sort_by do |node|
-        revenue = trains
-          .map { |train| node.route_revenue(@game.phase, train) }
-          .max
-        [
-          node.tokened_by?(corporation) ? 0 : 1,
-          node.offboard? ? 0 : 1,
-          -revenue,
-        ]
-      end
+      tokened_nodes = graph.connected_nodes(corporation).keys.filter { |n| n.tokened_by?(corporation) }
 
       path_walk_timed_out = false
       now = Time.now
 
-      skip_paths = static.flat_map(&:paths).to_h { |path| [path, true] }
+      skip_paths = [0]
+      modify_bitfield_from_paths(skip_paths, static.flat_map(&:paths))
       # if only routing for subset of trains, omit the trains we won't assemble routes for
       skip_trains = static.flat_map(:train).to_a
       trains -= skip_trains
 
       train_routes = Hash.new { |h, k| h[k] = [] }    # map of train to route list
-      hexside_bits = Hash.new { |h, k| h[k] = 0 }     # map of hexside_id to bit number
+      @hexside_bits = Hash.new { |h, k| h[k] = 0 }     # map of hexside_id to bit number
       @next_hexside_bit = 0
 
-      nodes.each do |node|
+      paths_walked_of_len = Hash.new { |h, k| h[k] = 0 }
+      all_exception_count = Hash.new { |h, k| h[k] = 0 }
+      overcounts = 0
+      paths_yielded = 0
+      route_counts = 0
+      tokened_nodes.each do |node|
         if Time.now - now > path_timeout
           LOGGER.debug('Path timeout reached')
           path_walk_timed_out = true
           break
         else
-          LOGGER.debug { "Path search: #{nodes.index(node)} / #{nodes.size} - paths starting from #{node.hex.name}" }
+          #LOGGER.debug { "Path search: #{nodes.index(node)} / #{nodes.size} - paths starting from #{node.hex.name}" }
         end
 
         walk_corporation = graph.no_blocking? ? nil : corporation
-        node.walk(corporation: walk_corporation, skip_paths: skip_paths) do |_, vp|
-          paths = vp.keys
-          chains = []
-          chain = []
-          left = nil
-          right = nil
-          last_left = nil
-          last_right = nil
 
-          complete = lambda do
-            chains << { nodes: [left, right], paths: chain, hexes: chain.map(&:hex) }
-            last_left = left
-            last_right = right
-            left, right = nil
-            chain = []
+        walk_node_if_not_blocked = lambda do |visited_nodes, node, skip, ts, &block|
+          if ts.nil?
+            raise "no trains"
           end
+          ret = block.call(visited_nodes, {}, [], ts, [])
+          raise "abort found" if ret == :abort
+          if ret != []
+            if walk_corporation.nil? || !node.blocks?(walk_corporation)
+              walk_via_chain(node, ret, corporation: walk_corporation, visited_nodes: visited_nodes, skip_paths: skip, &block)
+            end
+          end
+          ret
+        end
 
-          assign = lambda do |a, b|
-            if a && b
-              if a == last_left || b == last_right
-                left = b
-                right = a
-              else
-                left = a
-                right = b
+        node_walk_one_path = lambda do |node, trains, &block|
+          all_paths = []
+          node.paths.each do |path|
+            path.walk do |path, vp|
+              path.nodes.each do |inner_node|
+                if inner_node != node
+                  all_paths << { path_from_token_to_node: vp.keys, node: inner_node}
+                end
               end
-              complete.call
-            elsif !left
-              left = a || b
-            elsif !right
-              right = a || b
-              complete.call
             end
           end
 
-          paths.each do |path|
-            chain << path
-            a, b = path.nodes
-
-            assign.call(a, b) if a || b
+          # TODO: single node
+          puts "do single paths for node #{node.hex.name}"
+          walk_node_if_not_blocked.call([[node, true]].to_h, node, {}, trains) do |vn1, vp, visited_bitfield, ts, prebuilt_chain|
+            if prebuilt_chain == []
+              next ts
+            else
+              next block.call(ts, prebuilt_chain, visited_bitfield)
+            end
           end
 
-          # a 1-city Local train will have no chains but will have a left; route.revenue will reject if not valid for game
-          if chains.empty?
-            next unless left
+          for i in 0...all_paths.size-1
+            for j in i+1...all_paths.size
+              puts "doing paths #{i} and #{j} for node #{node.hex.name}"
+              next if all_paths[i][:path_from_token_to_node].intersect?(all_paths[j][:path_from_token_to_node])
+              skip_inner = skip_paths.clone
+              modify_bitfield_from_paths(skip_inner, all_paths[i][:path_from_token_to_node])
+              modify_bitfield_from_paths(skip_inner, all_paths[j][:path_from_token_to_node])
+              middle_chain = [
+                { nodes: [all_paths[j][:node], node], paths: all_paths[j][:path_from_token_to_node].reverse, hexes: all_paths[j][:path_from_token_to_node].reverse.map(&:hex) },
+                { nodes: [node, all_paths[i][:node]], paths: all_paths[i][:path_from_token_to_node], hexes: all_paths[i][:path_from_token_to_node].map(&:hex) },]
+              part2 = reverse_chain(middle_chain)
+              middle_bitfield = [0]
+              modify_bitfield_from_paths(middle_bitfield, all_paths[i][:path_from_token_to_node])
+              modify_bitfield_from_paths(middle_bitfield, all_paths[j][:path_from_token_to_node])
+              vn0 = [node, all_paths[i][:node], all_paths[j][:node]].map { |e| [e, true] }.to_h
+              next if vn0.size != 3
+              walk_node_if_not_blocked.call(vn0, all_paths[i][:node], skip_inner, trains) do |vn1, vp, visited_bitfield1, t1, prebuilt_chain1|
+                skip_inner2 = `js_route_bitfield_merge`.call(skip_inner, visited_bitfield1)
+                part1 = reverse_chain(prebuilt_chain1)
+                first_bitfield = `js_route_bitfield_merge`.call(middle_bitfield, visited_bitfield1)
+                ret = walk_node_if_not_blocked.call(vn1, all_paths[j][:node], skip_inner2, t1) do |vn2, vp2, visited_bitfield2, t2, prebuilt_chain2|
+                  #puts "VISITED NODES 1: #{vn1.inspect} 2: #{vn2.inspect}"
+                  part3 = prebuilt_chain2
+                  #raise "missmatch1" if part1.size != 0 and (part1.last[:nodes][1] != part2[0][:nodes][0])
+                  #raise "missmatch2" if part3.size != 0 and (part2.last[:nodes][1] != part3[0][:nodes][0])
+                  #puts "inconsistent_chain" if part1.size > 1 and (part1.slice(0..-2).zip(part1.slice(1..-1)).filter { |x| x[0][:nodes][1] != x[1][:nodes][0] } != [])
+                  #puts "inconsistent_chain" if part3.size > 1 and (part3.slice(0..-2).zip(part3.slice(1..-1)).filter { |x| x[0][:nodes][1] != x[1][:nodes][0] } != [])
+                  next block.call(t2, part1 + part2 + part3, `js_route_bitfield_merge`.call(first_bitfield, visited_bitfield2))
+                end
 
-            chains << { nodes: [left, nil], paths: [] }
-
-            # use the Local train's 1 city instead of any paths as their key;
-            # only 1 train can visit each city, but we want Locals to be able to
-            # visit multiple different cities if a corporation has more than one
-            # of them
-            id = [left]
-          else
-            id = chains.flat_map { |c| c[:paths] }.sort!
+                next ret
+              end
+            end
           end
 
-          next if connections[id]
+          # Don't allow future searches to enter this hex because we know all paths through this hex are fully explored
+          modify_bitfield_from_paths(skip_paths, node.paths)
+        end
 
-          connections[id] = chains.map do |c|
+        # TODO: .walk(corporation: walk_corporation, skip_paths: skip_paths
+        #
+        visit_count = 0
+        node_walk_one_path.call(node, trains) do |ts, prebuilt_chain, bitfield_passed_in|
+          paths_yielded += 1
+          chains = prebuilt_chain
+          # if we have an empty bitfield, just always check the route. this is basically for local trains with no path
+          if bitfield_passed_in != [0] && connections[bitfield_passed_in]
+            overcounts += 1
+            next []
+          end
+          connections[bitfield_passed_in] = true
+
+          connection = chains.map do |c|
             { left: c[:nodes][0], right: c[:nodes][1], chain: c }
           end
 
-          connection = connections[id]
 
           # each train has opportunity to vote to abort a branch of this node's path-walk tree
-          path_abort = trains.to_h { |train| [train, true] }
+          visit_count += 1
+          if visit_count % 4096 == 0
+            LOGGER.debug do
+              "all exceptions: #{all_exception_count.map { |k, v| "#{k}: #{v}" }.join(', ')}"
+            end
+          end
 
           # build a test route for each train, use route.revenue to check for errors, keep the good ones
-          trains.each  do |train|
+          next ts.filter  do |train|
             route = Engine::Route.new(
               @game,
               @game.phase,
@@ -161,21 +193,30 @@ module Engine
               # If we don't clone, then later route.touch_node calls will affect all routes with
               # the same connection array
               connection_data: connection.clone,
-              bitfield: bitfield_from_connection(connection, hexside_bits),
+              bitfield: bitfield_passed_in,
             )
             route.routes = [route]
+            route_counts += 1
             # defer route combination checks until we have the full combination of routes to check
             route.revenue(suppress_check_route_combination: true)
             train_routes[train] << route
-          rescue RouteTooLong
+            true
+          rescue RouteTooLong => e
+            all_exception_count[:route_too_long] += 1
             # ignore for this train, and abort walking this path if ignored for all trains
-            path_abort.delete(train)
+            false
+          rescue GameErrorInvalidRouteThatCantBeFixed => e
+            all_exception_count[e.message] += 1
+            false
           rescue ReusesCity
-            path_abort.clear
-          rescue NoToken, RouteTooShort, GameError # rubocop:disable Lint/SuppressedException
+            puts "reuses city: #{route.revenue_str}"
+            all_exception_count[:reuses_city] += 1
+            false
+            #TODO: next []
+          rescue NoToken, RouteTooShort, GameError => e # rubocop:disable Lint/SuppressedException
+            all_exception_count[e.message] += 1
+            true
           end
-
-          next :abort if path_abort.empty?
         end
       end
 
@@ -184,10 +225,22 @@ module Engine
         "Evaluated #{connections.size} paths, found #{@next_hexside_bit} unique hexsides, and found valid routes "\
           "#{train_routes.map { |k, v| k.name + ':' + v.size.to_s }.join(', ')} in: #{Time.now - now}"
       end
+      LOGGER.debug do
+        "Paths walked: #{paths_walked_of_len.map { |k, v| "#{k}: #{v}" }.join(', ')}"
+      end
+      LOGGER.debug do
+        "Total Paths walked: #{paths_walked_of_len.values.sum}, "
+      end
+      LOGGER.debug do
+        "all exceptions: #{all_exception_count.map { |k, v| "#{k}: #{v}" }.join(', ')}"
+      end
+      LOGGER.debug do
+        "Overcount is #{overcounts}; route_counts is #{route_counts} paths_yielded is #{paths_yielded}"
+      end
 
       static.each do |route|
         # recompute bitfields of passed-in routes since the bits may have changed across auto-router runs
-        route.bitfield = bitfield_from_connection(route.connection_data, hexside_bits)
+        route.bitfield = bitfield_from_connection(route.connection_data)
         train_routes[route.train] = [route] # force this train's route to be the passed-in one
       end
 
@@ -198,63 +251,147 @@ module Engine
       [train_routes, path_walk_timed_out]
     end
 
-    # inputs:
-    #   connection is a route's connection_data
-    #   hexside_bits is a map of hexside_id to bit number
-    # returns:
-    #   the bitfield (array of ints) representing all hexsides in the connection path
-    # updates:
-    #   new hexsides are added to hexside_bits
-    def bitfield_from_connection(connection, hexside_bits)
-      bitfield = [0]
-      connection.each do |conn|
-        paths = conn[:chain][:paths]
-        if paths.size == 1 # special case for tiny intra-tile path like in 18NewEngland (issue #6890)
-          hexside_left = paths[0].nodes[0].id
-          check_edge_and_set(bitfield, hexside_left, hexside_bits)
-          if paths[0].nodes.size > 1 # local trains may not have a second node
-            hexside_right = paths[0].nodes[1].id
-            check_edge_and_set(bitfield, hexside_right, hexside_bits)
-          end
-        else
-          (paths.size - 1).times do |index|
-            # hand-optimized ruby gives faster opal code
-            node1 = paths[index]
-            node2 = paths[index + 1]
-            case node1.edges.size
-            when 1
-              # node1 has 1 edge, connect it to first edge of node2
-              hexside_left = node1.edges[0].id
-              hexside_right = node2.edges[0].id
-              check_and_set(bitfield, hexside_left, hexside_right, hexside_bits)
-            when 2
-              # node1 has 2 edges, connect them as well as 2nd edge to first node2 edge
-              hexside_left = node1.edges[0].id
-              hexside_right = node1.edges[1].id
-              check_and_set(bitfield, hexside_left, hexside_right, hexside_bits)
-              hexside_left = hexside_right
-              hexside_right  = node2.edges[0].id
-              check_and_set(bitfield, hexside_left, hexside_right, hexside_bits)
-            else
-              LOGGER.debug "  ERROR: auto-router found unexpected number of path node edges #{node1.edges.size}. "\
-                           'Route combos may be be incorrect'
+    def single_path_to_string(path)
+        "#{path.hex.name}-#{path.exits}"
+    end
+
+    def paths_to_string(paths)
+      if !paths.empty? and single_path_to_string(paths[0]) > single_path_to_string(paths[-1])
+        paths = paths.reverse()
+      end
+
+      paths.map do |path|
+        "#{path.hex.name}-#{path.exits}"
+      end.join('/')
+    end
+
+    def chains(node)
+      @chains[node] ||= begin
+        chains = []
+
+        node.paths.each do |node_path|
+          next if node_path.ignore?
+
+          node_path.walk() do |path, vp, ct, converging|
+            path.nodes.each do |next_node|
+              next if next_node == node
+              prebuilt_chain = { nodes: [node, next_node], paths: vp.keys, hexes: vp.keys.map(&:hex) }
+              bitfield = [0]
+              modify_bitfield_from_paths(bitfield, vp.keys)
+              chains << [path, bitfield, next_node, prebuilt_chain]
             end
           end
         end
+
+        chains
+      end
+    end
+
+    def walk_via_chain(
+      node,
+      trains,
+      corporation: nil,
+      visited_nodes: {},
+      prebuilt_chain: [],
+      visited_bitfield: [0],
+      skip_paths: [0],
+      &block
+    )
+      # visited_nodes[self] = true # is this needed?
+
+      chains(node).each do |path, chain_bitfield, nn, prebuilt_chain_part|
+        #TODO does next [] == next?
+        next [] if `js_route_bitfield_conflicts`.call(visited_bitfield, chain_bitfield)
+        next [] if `js_route_bitfield_conflicts`.call(skip_paths, chain_bitfield)
+        next [] if visited_nodes[nn]
+        visited_bitfield2 = `js_route_bitfield_merge`.call(visited_bitfield, chain_bitfield)
+        visited_nodes[nn] = true
+        chains = prebuilt_chain + [prebuilt_chain_part]
+        next_level_trains = yield visited_nodes, {}, visited_bitfield2, trains, chains
+        # TODO can the path be terminal?
+        if next_level_trains == [] || path.terminal? || (corporation && nn.blocks?(corporation))
+          visited_nodes.delete(nn)
+          next
+        end
+
+
+        walk_via_chain(
+          nn,
+          next_level_trains,
+          prebuilt_chain: chains,
+          corporation: corporation,
+          visited_bitfield: visited_bitfield2,
+          visited_nodes: visited_nodes,
+          skip_paths: skip_paths,
+          &block
+        )
+        visited_nodes.delete(nn)
+      end
+      #visited_nodes.delete(self)
+    end
+
+    # inputs:
+    #   connection is a route's connection_data
+    # returns:
+    #   the bitfield (array of ints) representing all hexsides in the connection path
+    def bitfield_from_connection(connection)
+      bitfield = [0]
+      connection.each do |conn|
+        paths = conn[:chain][:paths]
+        modify_bitfield_from_paths(bitfield, paths)
       end
       bitfield
     end
 
-    def check_and_set(bitfield, hexside_left, hexside_right, hexside_bits)
-      check_edge_and_set(bitfield, hexside_left, hexside_bits)
-      check_edge_and_set(bitfield, hexside_right, hexside_bits)
+    def modify_bitfield_from_paths(bitfield, paths)
+      if paths.size == 1 # special case for tiny intra-tile path like in 18NewEngland (issue #6890)
+        hexside_left = paths[0].nodes[0].id
+        check_edge_and_set(bitfield, hexside_left)
+        if paths[0].nodes.size > 1 # local trains may not have a second node
+          hexside_right = paths[0].nodes[1].id
+          check_edge_and_set(bitfield, hexside_right)
+        end
+      else
+        (paths.size - 1).times do |index|
+          # hand-optimized ruby gives faster opal code
+          node1 = paths[index]
+          node2 = paths[index + 1]
+          case node1.edges.size
+          when 1
+            # node1 has 1 edge, connect it to first edge of node2
+            hexside_left = node1.edges[0].id
+            hexside_right = node2.edges[0].id
+            check_and_set(bitfield, hexside_left, hexside_right)
+          when 2
+            # node1 has 2 edges, connect them as well as 2nd edge to first node2 edge
+            hexside_left = node1.edges[0].id
+            hexside_right = node1.edges[1].id
+            check_and_set(bitfield, hexside_left, hexside_right)
+            hexside_left = hexside_right
+            hexside_right  = node2.edges[0].id
+            check_and_set(bitfield, hexside_left, hexside_right)
+          else
+            LOGGER.debug "  ERROR: auto-router found unexpected number of path node edges #{node1.edges.size}. "\
+                         'Route combos may be be incorrect'
+          end
+        end
+      end
     end
 
-    def check_edge_and_set(bitfield, hexside_edge, hexside_bits)
-      if hexside_bits.include?(hexside_edge)
-        set_bit(bitfield, hexside_bits[hexside_edge])
+    def reverse_chain(chain)
+      chain.reverse.map do |c| { nodes: c[:nodes].reverse, paths: c[:paths].reverse, hexes: c[:hexes].reverse } end
+    end
+
+    def check_and_set(bitfield, hexside_left, hexside_right)
+      check_edge_and_set(bitfield, hexside_left)
+      check_edge_and_set(bitfield, hexside_right)
+    end
+
+    def check_edge_and_set(bitfield, hexside_edge)
+      if @hexside_bits.include?(hexside_edge)
+        set_bit(bitfield, @hexside_bits[hexside_edge])
       else
-        hexside_bits[hexside_edge] = @next_hexside_bit
+        @hexside_bits[hexside_edge] = @next_hexside_bit
         set_bit(bitfield, @next_hexside_bit)
         @next_hexside_bit += 1
       end

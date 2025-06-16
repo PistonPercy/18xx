@@ -569,6 +569,8 @@ module Engine
         end
 
         def check_distance(route, visits)
+          super
+
           raise GameError, 'Cannot run Pullman train' if pullman_train?(route.train)
 
           if train_type(route.train) == :etrain &&
@@ -588,8 +590,6 @@ module Engine
 
           # Special case when a train just runs english channel to france, this only counts as one visit
           raise GameError, 'Route must have at least 2 stops' if english_channel_visit == 2 && visits.size == 2
-
-          super
         end
 
         def check_overlap(routes)

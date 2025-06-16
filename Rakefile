@@ -1,5 +1,12 @@
 # frozen_string_literal: true
 
+desc 'Precompile assets for me'
+task :precompile_me do
+  require_relative 'lib/assets'
+  assets = Assets.new(cache: true, compress: false, gzip: false, source_map: true)
+  assets.combine(['1858'])
+end
+
 unless ENV['RACK_ENV'] == 'production'
   require 'parallel_tests'
   require 'rspec/core/rake_task'

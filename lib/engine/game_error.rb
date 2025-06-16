@@ -17,4 +17,7 @@ module Engine
 
   class ReusesCity < GameError
   end
+
+  class GameErrorInvalidRouteThatCantBeFixed < GameError
+  end
 end

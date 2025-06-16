@@ -366,7 +366,7 @@ module Engine
           if hex_train?(route.train)
             limit = route.train.distance
             distance = route_distance(route)
-            raise GameError, "#{distance} is too many hex edges for #{route.train.name} train" if distance > limit
+            raise GameErrorInvalidRouteThatCantBeFixed, "#{distance} is too many hex edges for #{route.train.name} train" if distance > limit
           else
             super
           end
@@ -388,9 +388,9 @@ module Engine
           track_types = route.chains.flat_map { |item| item[:paths] }.flat_map(&:track).uniq
 
           if metre_gauge_train?(route.train)
-            raise GameError, 'Route cannot contain broad gauge track' if track_types.include?(:broad)
+            raise GameErrorInvalidRouteThatCantBeFixed, 'ZZRoute cannot contain broad gauge track' if track_types.include?(:broad)
           elsif track_types.include?(:narrow)
-            raise GameError, 'Route cannot contain metre gauge track'
+            raise GameErrorInvalidRouteThatCantBeFixed, 'Route cannot contain metre gauge track'
           end
         end
 

@@ -46,7 +46,7 @@ class Assets
     end
   end
 
-  def initialize(compress: false, gzip: false, cache: true, precompiled: false, source_maps: false)
+  def initialize(compress: false, gzip: false, cache: true, precompiled: false, source_maps: true, source_map: false)
     @build_path = 'build'
     @out_path = OUTPUT_BASE + '/assets'
     @root_path = '/assets'
