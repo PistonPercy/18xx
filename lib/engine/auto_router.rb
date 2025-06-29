@@ -83,35 +83,20 @@ module Engine
         walk_corporation = graph.no_blocking? ? nil : corporation
 
         walk_node_if_not_blocked = lambda do |visited_nodes, node, skip, ts, &block|
-          if ts.nil?
-            raise "no trains"
-          end
           ret = block.call(visited_nodes, {}, [], ts, [])
-          raise "abort found" if ret == :abort
-          if ret != []
-            if walk_corporation.nil? || !node.blocks?(walk_corporation)
-              walk_via_chain(node, ret, corporation: walk_corporation, visited_nodes: visited_nodes, skip_paths: skip, &block)
-            end
+          if ret != [] && (walk_corporation.nil? || !node.blocks?(walk_corporation))
+            walk_via_chain(node, ret, corporation: walk_corporation, visited_nodes: visited_nodes, skip_paths: skip, &block)
           end
           ret
         end
 
         node_walk_one_path = lambda do |node, trains, &block|
-          all_paths = []
-          node.paths.each do |path|
-            path.walk do |path, vp|
-              path.nodes.each do |inner_node|
-                if inner_node != node
-                  all_paths << { path_from_token_to_node: vp.keys, node: inner_node}
-                end
-              end
-            end
-          end
+          all_paths = chains(node)
 
-          # TODO: single node
           puts "do single paths for node #{node.hex.name}"
           walk_node_if_not_blocked.call([[node, true]].to_h, node, {}, trains) do |vn1, vp, visited_bitfield, ts, prebuilt_chain|
             if prebuilt_chain == []
+              # TODO: single node
               next ts
             else
               next block.call(ts, prebuilt_chain, visited_bitfield)
@@ -121,24 +106,25 @@ module Engine
           for i in 0...all_paths.size-1
             for j in i+1...all_paths.size
               puts "doing paths #{i} and #{j} for node #{node.hex.name}"
-              next if all_paths[i][:path_from_token_to_node].intersect?(all_paths[j][:path_from_token_to_node])
-              skip_inner = skip_paths.clone
-              modify_bitfield_from_paths(skip_inner, all_paths[i][:path_from_token_to_node])
-              modify_bitfield_from_paths(skip_inner, all_paths[j][:path_from_token_to_node])
-              middle_chain = [
-                { nodes: [all_paths[j][:node], node], paths: all_paths[j][:path_from_token_to_node].reverse, hexes: all_paths[j][:path_from_token_to_node].reverse.map(&:hex) },
-                { nodes: [node, all_paths[i][:node]], paths: all_paths[i][:path_from_token_to_node], hexes: all_paths[i][:path_from_token_to_node].map(&:hex) },]
-              part2 = reverse_chain(middle_chain)
-              middle_bitfield = [0]
-              modify_bitfield_from_paths(middle_bitfield, all_paths[i][:path_from_token_to_node])
-              modify_bitfield_from_paths(middle_bitfield, all_paths[j][:path_from_token_to_node])
-              vn0 = [node, all_paths[i][:node], all_paths[j][:node]].map { |e| [e, true] }.to_h
+              i_node = all_paths[i][2]
+              j_node = all_paths[j][2]
+              i_chain = all_paths[i][3]
+              j_chain = all_paths[j][3]
+              i_bitfield = all_paths[i][1]
+              j_bitfield = all_paths[j][1]
+              next if `js_route_bitfield_conflicts`.call(i_bitfield, j_bitfield)
+              vn0 = [node, i_node, j_node].map { |e| [e, true] }.to_h
               next if vn0.size != 3
-              walk_node_if_not_blocked.call(vn0, all_paths[i][:node], skip_inner, trains) do |vn1, vp, visited_bitfield1, t1, prebuilt_chain1|
+
+              middle_chain = [reverse_chain([j_chain])[0], i_chain]
+              part2 = reverse_chain(middle_chain)
+              middle_bitfield = `js_route_bitfield_merge`.call(i_bitfield, j_bitfield)
+              skip_inner = `js_route_bitfield_merge`.call(skip_inner, middle_bitfield)
+              walk_node_if_not_blocked.call(vn0, i_node, skip_inner, trains) do |vn1, vp, visited_bitfield1, t1, prebuilt_chain1|
                 skip_inner2 = `js_route_bitfield_merge`.call(skip_inner, visited_bitfield1)
                 part1 = reverse_chain(prebuilt_chain1)
                 first_bitfield = `js_route_bitfield_merge`.call(middle_bitfield, visited_bitfield1)
-                ret = walk_node_if_not_blocked.call(vn1, all_paths[j][:node], skip_inner2, t1) do |vn2, vp2, visited_bitfield2, t2, prebuilt_chain2|
+                ret = walk_node_if_not_blocked.call(vn1, j_node, skip_inner2, t1) do |vn2, vp2, visited_bitfield2, t2, prebuilt_chain2|
                   #puts "VISITED NODES 1: #{vn1.inspect} 2: #{vn2.inspect}"
                   part3 = prebuilt_chain2
                   #raise "missmatch1" if part1.size != 0 and (part1.last[:nodes][1] != part2[0][:nodes][0])
