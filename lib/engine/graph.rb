@@ -196,6 +196,7 @@ module Engine
       hexes = Hash.new { |h, k| h[k] = {} }
       nodes = {}
       paths = {}
+      last_two_paths = {}
 
       @walk_calls[corporation] = Hash.new(0)
 
@@ -261,9 +262,16 @@ module Engine
 
         node.walk(visited: visited, corporation: walk_corporation, skip_track: @skip_track,
                   skip_paths: skip_paths, converging_path: false, walk_calls: @walk_calls[corporation],
-                  backtracking: @backtracking) do |path, _, _|
+                  backtracking: @backtracking) do |path, vp, _|
+
+          # if we have seen the path before coming from the exact path before it, then stop walking because we know
+          # the graph traversal has already gone through this path segment going the same direction before.
+          next :abort if last_two_paths[vp.keys.last(2)]
+
+          # we have seen the path before so we don't need to run the body again
           next if paths[path]
 
+          last_two_paths[vp.keys.last(2)] = path
           paths[path] = true
 
           path.nodes.each do |p_node|
@@ -323,7 +331,7 @@ module Engine
 
       LOGGER.debug do
         "    Graph computed with #{walk_calls(corporation)[:not_skipped]} "\
-          "completed walk calls (skipped #{walk_calls(corporation)[:skipped]})"
+          "completed walk calls (skipped #{walk_calls(corporation)[:skipped]}) and found #{hexes.count} hexes, #{nodes.count} nodes, #{paths.count} paths"
       end
     end
   end
